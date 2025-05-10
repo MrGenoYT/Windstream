@@ -1,99 +1,126 @@
-import axios from 'axios';
+import express from 'express'
+import { exec } from 'child_process'
+import { v4 as uuidv4 } from 'uuid'
+import fs from 'fs'
+import path from 'path'
+import { fileURLToPath } from 'url'
+import os from 'os'
 
-/**
- * Main API configuration with axios
- */
-const API = axios.create({
-  baseURL: import.meta.env.VITE_BACKEND_URL
-});
+const router = express.Router()
+const __filename = fileURLToPath(import.meta.url)
+const __dirname = path.dirname(__filename)
+const downloadDir = path.join(__dirname, '../downloads')
 
-/**
- * Custom error handler to extract the error message from the response
- */
-const handleApiError = (error) => {
-  // Extract the most specific error message available
-  const errorMessage = 
-    error.response?.data?.details || 
-    error.response?.data?.error || 
-    error.message || 
-    'An unknown error occurred';
+// Ensure download directory exists
+if (!fs.existsSync(downloadDir)) fs.mkdirSync(downloadDir)
+
+// Determine appropriate browser for the current OS
+const getBrowserCookiesFlag = () => {
+  const platform = os.platform()
   
-  // Create a new error with the extracted message
-  const formattedError = new Error(errorMessage);
+  // For demonstration, we're providing common browser options
+  // Chrome is widely available on most platforms
+  if (platform === 'darwin') return '--cookies-from-browser chrome'  // macOS
+  if (platform === 'win32') return '--cookies-from-browser chrome'   // Windows
+  return '--cookies-from-browser firefox'  // Linux and others default to Firefox
+}
+
+router.post('/parse', (req, res) => {
+  const { url } = req.body
+  if (!url) return res.status(400).json({ error: 'URL is required' })
+
+  // Use cookies from browser to avoid the "not a bot" verification
+  // This assumes Chrome/Firefox is installed on the server
+  const cookiesFlag = getBrowserCookiesFlag()
   
-  // Preserve the original error properties
-  formattedError.originalError = error;
-  formattedError.status = error.response?.status;
+  const command = `yt-dlp ${cookiesFlag} -J "${url}"`
+
+  exec(command, (err, stdout, stderr) => {
+    if (err) {
+      console.error('Error executing yt-dlp:', stderr)
+      return res.status(500).json({ 
+        error: 'Failed to fetch video info',
+        details: stderr
+      })
+    }
+
+    try {
+      const data = JSON.parse(stdout)
+      
+      // Extract video thumbnail
+      const thumbnail = data.thumbnail || 
+                        (data.thumbnails && data.thumbnails.length > 0 ? 
+                         data.thumbnails[data.thumbnails.length - 1].url : 
+                         '');
+      
+      const formats = data.formats
+        .filter(f => f.url && (f.vcodec !== 'none' || f.acodec !== 'none'))
+        .map(f => ({
+          url: f.url,
+          quality: f.format_note || f.quality_label || f.height?.toString() || 
+                  (f.acodec !== 'none' ? f.asr?.toString() + 'Hz' : null) || 'unknown',
+          type: f.vcodec === 'none' ? 'Audio' : f.acodec === 'none' ? 'Video' : 'Audio+Video',
+          ext: f.ext || 'mp4',
+          filesize: f.filesize ? Math.round(f.filesize / (1024 * 1024)) + ' MB' : 'Unknown size'
+        }))
+
+      res.json({
+        title: data.title,
+        thumbnail,
+        formats
+      })
+    } catch (parseError) {
+      console.error('Error parsing video info:', parseError)
+      res.status(500).json({ error: 'Error parsing video info' })
+    }
+  })
+})
+
+// Add a download endpoint with cookies support
+router.post('/download', (req, res) => {
+  const { url, format = 'best' } = req.body
+  if (!url) return res.status(400).json({ error: 'URL is required' })
+
+  // Generate a unique filename
+  const fileId = uuidv4()
+  const outputTemplate = path.join(downloadDir, `${fileId}.%(ext)s`)
   
-  throw formattedError;
-};
-
-/**
- * Fetch video information from a URL
- * @param {string} url - Video URL to extract information from
- * @returns {Promise<Object>} - Video metadata and available formats
- */
-export const fetchInfo = async (url) => {
-  try {
-    const response = await API.post('/api/parse', { url });
-    return response;
-  } catch (error) {
-    return handleApiError(error);
-  }
-};
-
-/**
- * Download a video with specific format
- * @param {string} url - Video URL to download
- * @param {string} format - Format ID to download (optional)
- * @returns {Promise<Object>} - Download information including download URL
- */
-export const downloadVideo = async (url, format = 'best') => {
-  try {
-    const response = await API.post('/api/download', { url, format });
-    return response;
-  } catch (error) {
-    return handleApiError(error);
-  }
-};
-
-/**
- * Get full download URL for a file
- * @param {string} relativePath - Relative path returned from the download endpoint
- * @returns {string} - Full URL to download the file
- */
-export const getDownloadUrl = (relativePath) => {
-  // Remove leading slash if present
-  const path = relativePath.startsWith('/') ? relativePath.substring(1) : relativePath;
-  return `${import.meta.env.VITE_BACKEND_URL}/${path}`;
-};
-
-/**
- * Check if a URL is valid for processing
- * @param {string} url - URL to validate
- * @returns {boolean} - Whether the URL is valid
- */
-export const isValidVideoUrl = (url) => {
-  if (!url) return false;
+  // Use cookies from browser
+  const cookiesFlag = getBrowserCookiesFlag()
   
-  try {
-    // Create URL object to validate
-    const urlObj = new URL(url);
-    
-    // Check if it's from a supported domain
-    const supportedDomains = [
-      'youtube.com', 
-      'youtu.be', 
-      'vimeo.com', 
-      'dailymotion.com',
-      'facebook.com',
-      'twitch.tv',
-      'twitter.com',
-      'instagram.com'
-    ];
-    
-    return supportedDomains.some(domain => urlObj.hostname.includes(domain));
-  } catch (error) {
-    return false;
-  }
-};
+  // Command for downloading with format selection
+  const formatFlag = format !== 'best' ? `-f ${format}` : '-f best'
+  const command = `yt-dlp ${cookiesFlag} ${formatFlag} -o "${outputTemplate}" "${url}"`
+
+  exec(command, (err, stdout, stderr) => {
+    if (err) {
+      console.error('Download error:', stderr)
+      return res.status(500).json({ 
+        error: 'Failed to download video',
+        details: stderr
+      })
+    }
+
+    // Find the created file
+    fs.readdir(downloadDir, (err, files) => {
+      if (err) {
+        return res.status(500).json({ error: 'Could not read download directory' })
+      }
+      
+      const downloadedFile = files.find(file => file.startsWith(fileId))
+      
+      if (!downloadedFile) {
+        return res.status(500).json({ error: 'File not found after download' })
+      }
+      
+      const downloadPath = `/downloads/${downloadedFile}`
+      res.json({ 
+        success: true, 
+        message: 'Download completed',
+        downloadPath 
+      })
+    })
+  })
+})
+
+export default router
